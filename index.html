@@ -81,6 +81,12 @@ h1 span{color:var(--accent)}
 .tok:hover,.tok:focus-visible{border-color:var(--accent);color:var(--accent);outline:0}
 .tok.used{opacity:.45;text-decoration:line-through}
 .hintline{font-size:12px;color:var(--muted)}
+#paste{width:100%;font:inherit;font-size:16px;font-family:var(--mono);padding:10px;min-height:84px;
+  background:var(--paper);color:var(--ink);border:1px solid var(--rule-strong);resize:vertical}
+#paste:focus-visible{outline:0;border-color:var(--accent)}
+.steps{font-size:12.5px;color:var(--muted);line-height:1.45;margin:0;padding-left:17px}
+.steps b{color:var(--ink)}
+.panel.primary{border-color:var(--accent);border-width:2px}
 
 /* questions */
 .qs{display:grid}
@@ -156,6 +162,18 @@ footer{padding:16px max(14px,env(safe-area-inset-left)) 34px;font-size:11.5px;co
     <div class="hintline" id="scanMsg"></div>
     <div class="found" id="found"></div>
     <div class="hintline" id="tapHint" hidden>Tap any value above, then tap the question it belongs to.</div>
+  </section>
+
+  <section class="panel primary no-print" id="textPanel">
+    <h2><span>Scan text with your phone</span><small>most accurate</small></h2>
+    <ol class="steps">
+      <li><b>iPhone:</b> tap the box below, then pick <b>Scan Text</b> (the camera icon) in the menu that pops up. Point at the label.</li>
+      <li><b>Android:</b> run Google Lens on the photo, copy, paste here.</li>
+      <li>Or paste anything you copied out of a photo.</li>
+    </ol>
+    <textarea id="paste" placeholder="Tap here → Scan Text → point at the label" aria-label="Scanned or pasted label text"></textarea>
+    <div class="row"><button class="btn alt" id="findBtn">Find values in this text</button></div>
+    <div class="hintline" id="pasteMsg"></div>
   </section>
 
   <div class="legend">
@@ -411,12 +429,58 @@ window.addEventListener("DOMContentLoaded", () => {
     return out;
   }
 
-  let worker=null;
+  // Grayscale + Otsu threshold + upscale. Stamped/dot-matrix label text is low
+  // contrast; binarising first helps Tesseract far more than raw colour pixels.
+  function prep(src){
+    const scale = Math.max(src.width,src.height) < 1500 ? 2 : 1;
+    const c=document.createElement("canvas");
+    c.width=src.width*scale; c.height=src.height*scale;
+    const g=c.getContext("2d",{willReadFrequently:true});
+    g.imageSmoothingQuality="high";
+    g.drawImage(src,0,0,c.width,c.height);
+    const img=g.getImageData(0,0,c.width,c.height), p=img.data;
+    const hist=new Array(256).fill(0);
+    for(let i=0;i<p.length;i+=4){
+      const v=(p[i]*0.299+p[i+1]*0.587+p[i+2]*0.114)|0;
+      p[i]=p[i+1]=p[i+2]=v; hist[v]++;
+    }
+    const total=c.width*c.height;
+    let sum=0; for(let i=0;i<256;i++) sum+=i*hist[i];
+    let sumB=0,wB=0,best=0,thr=128;
+    for(let t=0;t<256;t++){
+      wB+=hist[t]; if(!wB) continue;
+      const wF=total-wB; if(!wF) break;
+      sumB+=t*hist[t];
+      const mB=sumB/wB, mF=(sum-sumB)/wF, between=wB*wF*(mB-mF)*(mB-mF);
+      if(between>best){ best=between; thr=t; }
+    }
+    for(let i=0;i<p.length;i+=4){
+      const v=p[i]<thr?0:255; p[i]=p[i+1]=p[i+2]=v;
+    }
+    g.putImageData(img,0,0);
+    return c;
+  }
+
+  let worker=null, progCb=()=>{}, pass=0;
   async function ocr(canvas,onProg){
     if(!window.Tesseract) throw new Error("OCR library didn't load — check your connection and reload.");
-    if(!worker) worker=await Tesseract.createWorker("eng",1,{logger:m=>{ if(m.status==="recognizing text") onProg(m.progress); }});
-    const {data}=await worker.recognize(canvas);
-    return data;
+    progCb=onProg;   // worker is built once; keep the callback current across images
+    if(!worker) worker=await Tesseract.createWorker("eng",1,
+      {logger:m=>{ if(m.status==="recognizing text") progCb((pass+m.progress)/2); }});
+    const img=prep(canvas);
+    // PSM 11 reads scattered label text; PSM 6 reads it as a block. Labels are a
+    // mix of both, so run each and merge — misses in one are often caught by the other.
+    let text="", lines=[];
+    for(const [idx,psm] of [["11"],["6"]].map((v,i)=>[i,v[0]])){
+      pass=idx;
+      try{
+        await worker.setParameters({tessedit_pageseg_mode:psm});
+        const {data}=await worker.recognize(img);
+        text += "\n" + (data.text||"");
+        lines = lines.concat(data.lines||[]);
+      }catch{}
+    }
+    return {text, lines};
   }
 
   async function handleFiles(files){
@@ -480,6 +544,55 @@ window.addEventListener("DOMContentLoaded", () => {
     $("camLbl").textContent="Scan another label";
   }
   $("file").addEventListener("change",e=>{ handleFiles(e.target.files); e.target.value=""; });
+
+  /* ---------- text path: iOS Scan Text / Live Text / Lens paste ----------
+     Apple's Vision engine is far better on dirty labels than in-browser OCR,
+     so the most accurate route is letting iOS do the reading and ingesting
+     the text it produces. */
+  async function digest(text, where){
+    if(!text || !text.trim()){ $("pasteMsg").textContent="Nothing to read yet — scan or paste some text first."; return; }
+    $("scanPanel").hidden=false;
+    $("found").innerHTML=""; offered.clear(); $("tapHint").hidden=true;
+    $("thumb").hidden=true; $("barWrap").hidden=true;
+    $("scanMeta").textContent=where;
+
+    const h=harvest(text);
+    let vin=null;
+    for(const v of h.vins) if(vinOK(v)){ vin=v; break; }
+
+    h.vins.forEach(v=>offer(v));
+    h.bits.forEach(b=>offer(b));
+    text.split(/[\n\r]+/).map(l=>l.trim().replace(/\s+/g," "))
+        .filter(l=>l.length>2 && l.length<64).slice(0,30).forEach(l=>offer(l));
+
+    const n=$("found").children.length;
+    if(vin){
+      $("vin").value=vin; syncVin();
+      $("scanMsg").innerHTML="<b>VIN found and check-digit verified.</b> Decoding…";
+      await decode();
+      const got=$("ident").textContent;
+      $("scanMsg").innerHTML="<b>VIN verified"+(got?" — "+got:"")+".</b> Tap any other value below to drop it into a question.";
+      $("pasteMsg").textContent="Found a valid VIN plus "+(n-1)+" other values.";
+    } else {
+      const near=h.vins.length;
+      $("scanMsg").textContent = n
+        ? "No check-digit-valid VIN here. Tap any value below to drop it into a question."
+        : "Couldn't pull anything useful out of that text.";
+      $("pasteMsg").textContent = near
+        ? near+" seventeen-character candidate(s) found but none passed the check digit — likely a misread character."
+        : (n ? n+" values found." : "");
+    }
+    if(n) $("found").scrollIntoView({behavior:"smooth",block:"nearest"});
+  }
+  $("findBtn").addEventListener("click",()=>digest($("paste").value,"from scanned text"));
+  // iOS inserts Scan Text results as an input event; auto-run once it looks substantial.
+  let pasteTimer=null;
+  $("paste").addEventListener("input",()=>{
+    clearTimeout(pasteTimer);
+    const v=$("paste").value;
+    if(v.trim().length<12) return;
+    pasteTimer=setTimeout(()=>digest(v,"from scanned text"),900);
+  });
 
   /* ---------- footer actions ---------- */
   $("print").addEventListener("click",()=>window.print());

@@ -327,6 +327,15 @@ window.addEventListener("DOMContentLoaded", () => {
     syncVin(); save();
   }
 
+  // 2 = NHTSA decodes it cleanly with a make, 1 = make but with warnings, 0 = nothing
+  async function probe(v){
+    try{
+      const d=(await (await fetch(VPIC+v+"?format=json")).json()).Results[0];
+      if(!has(d.Make)) return 0;
+      return String(d.ErrorCode).split(",")[0].trim()==="0" ? 2 : 1;
+    }catch{ return 0; }
+  }
+
   function chips(list){
     const el=$("chips"); el.innerHTML="";
     for(const c of list){ const s=document.createElement("span"); s.className="chip "+(c.c||""); s.textContent=c.t; el.appendChild(s); }
@@ -386,6 +395,57 @@ window.addEventListener("DOMContentLoaded", () => {
     } finally { setTimeout(()=>URL.revokeObjectURL(url),1000); }
   }
 
+  function zx(canvas){
+    try{
+      const hints=new Map();
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[
+        ZXing.BarcodeFormat.CODE_39,ZXing.BarcodeFormat.CODE_128,
+        ZXing.BarcodeFormat.DATA_MATRIX,ZXing.BarcodeFormat.PDF_417,ZXing.BarcodeFormat.ITF]);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER,true);
+      const reader=new ZXing.MultiFormatReader(); reader.setHints(hints);
+      const lum=new ZXing.HTMLCanvasElementLuminanceSource(canvas);
+      return reader.decode(new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum))).getText();
+    }catch{ return null; }
+  }
+  function turn(src,deg,maxDim){
+    const k=Math.min(1,maxDim/Math.max(src.width,src.height)), w=src.width*k, h=src.height*k;
+    const r=deg*Math.PI/180, cs=Math.abs(Math.cos(r)), sn=Math.abs(Math.sin(r));
+    const c=document.createElement("canvas");
+    c.width=Math.ceil(w*cs+h*sn); c.height=Math.ceil(w*sn+h*cs);
+    const g=c.getContext("2d",{willReadFrequently:true});
+    g.fillStyle="#fff"; g.fillRect(0,0,c.width,c.height);
+    g.translate(c.width/2,c.height/2); g.rotate(r); g.drawImage(src,-w/2,-h/2,w,h);
+    return c;
+  }
+
+  /* OCR near-miss repair. Text readers confuse look-alike characters (8/B, 5/S,
+     0/D, 1/J...). Try swapping those and keep fixes the check digit accepts.
+     Caveat: the check digit can't separate J from 1 (both weigh 1), so a
+     repaired VIN is always flagged for the student to confirm. */
+  const LOOK={"8":"B","B":"8","5":"S","S":"5","2":"Z","Z":"2","6":"G","G":"6","0":"D","D":"0",
+    "1":"JLT7","J":"1","L":"1","T":"17","7":"T1","4":"A","A":"4","U":"V","V":"U","H":"N","N":"HM","M":"N","E":"F","F":"E","C":"G"};
+  const DIGIT={B:"8",S:"5",Z:"2",G:"6",D:"0",J:"1",L:"1",T:"1",A:"4"};
+  function fixVin(raw){
+    let v=raw.toUpperCase().replace(/I/g,"1").replace(/[OQ]/g,"0");
+    if(v.length!==17) return [];
+    // positions 14-17 are always digits; position 9 is a digit or X
+    v=v.split("").map((ch,i)=>(i>=13||(i===8&&ch!=="X"))&&DIGIT[ch]?DIGIT[ch]:ch).join("");
+    if(vinOK(v)) return [v];
+    const opts=i=>(LOOK[v[i]]||"").split("").filter(ch=>!(i>=13&&!/\d/.test(ch)));
+    const out=[];
+    for(let i=0;i<17;i++) for(const a of opts(i)){
+      const one=v.slice(0,i)+a+v.slice(i+1);
+      if(vinOK(one)) out.push(one);
+    }
+    if(!out.length) for(let i=0;i<17;i++) for(const a of opts(i)) for(let j=i+1;j<17;j++) for(const b of opts(j)){
+      const two=v.slice(0,i)+a+v.slice(i+1,j)+b+v.slice(j+1);
+      if(vinOK(two)) out.push(two);
+    }
+    // J and 1 weigh the same in the check digit, so whichever was read, offer the other too
+    for(const c of [...out]) if(/^[J1]/.test(c)) out.push((c[0]==="J"?"1":"J")+c.slice(1));
+    return [...new Set(out)].slice(0,4);
+  }
+
   async function readBarcodes(canvas){
     const found=[];
     if("BarcodeDetector" in window){
@@ -395,17 +455,15 @@ window.addEventListener("DOMContentLoaded", () => {
       }catch{}
     }
     if(!found.length && window.ZXing){
-      try{
-        const hints=new Map();
-        hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[
-          ZXing.BarcodeFormat.CODE_39,ZXing.BarcodeFormat.CODE_128,
-          ZXing.BarcodeFormat.DATA_MATRIX,ZXing.BarcodeFormat.PDF_417,ZXing.BarcodeFormat.ITF]);
-        hints.set(ZXing.DecodeHintType.TRY_HARDER,true);
-        const reader=new ZXing.MultiFormatReader(); reader.setHints(hints);
-        const lum=new ZXing.HTMLCanvasElementLuminanceSource(canvas);
-        const bmp=new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
-        found.push(reader.decode(bmp).getText());
-      }catch{}
+      // Phone photos are tilted and soft. Retry at several sizes and angles
+      // (iOS Safari has no BarcodeDetector, so ZXing is the only reader there).
+      const t0=Date.now();
+      outer: for(const dim of [1800,1200,800]) for(const deg of [0,-5,5,-10,10,-15,15,90]){
+        if(Date.now()-t0>6000) break outer;
+        const hit=zx(turn(canvas,deg,dim));
+        if(hit){ found.push(hit); break outer; }
+        await new Promise(r=>setTimeout(r));   // keep the progress bar alive
+      }
     }
     return [...new Set(found.map(s=>String(s).trim()).filter(Boolean))];
   }
@@ -416,7 +474,14 @@ window.addEventListener("DOMContentLoaded", () => {
     const out={vins:[],bits:[]};
     const push=(v)=>{ if(v && !out.bits.includes(v)) out.bits.push(v); };
 
-    for(const m of up.matchAll(/[A-HJ-NPR-Z0-9]{17}/g)) out.vins.push(m[0]);
+    // Only whole 17-character tokens that look like a VIN: 6+ digits, and the last
+    // four readable as digits. Anything looser lets the repair step below "fix"
+    // ordinary words into fake VINs that happen to pass the check digit.
+    for(const tok of up.split(/[\s,;]+/)){
+      const t=tok.replace(/^VIN:?/,"").replace(/[^A-Z0-9]/g,"");
+      if(t.length===17 && (t.match(/\d/g)||[]).length>=6 && /^[0-9BSZGDJLTAOIQ]{4}$/.test(t.slice(13))) out.vins.push(t);
+    }
+    out.vins=[...new Set(out.vins)];
 
     for(const m of up.matchAll(/(\d{2,3})\s*(PSI|KPA)\b/g)) push(m[1]+" "+m[2]);
     for(const m of up.matchAll(/\bR-?\s?(134A|1234YF)\b/g)) push("R-"+m[1]);
@@ -503,7 +568,7 @@ window.addEventListener("DOMContentLoaded", () => {
       $("scanMsg").textContent="Looking for a barcode…";
       $("bar").style.width="18%";
       const codes=await readBarcodes(canvas);
-      let gotVin=null;
+      let gotVin=null, guessed=null;
       for(const c of codes){
         const v=clean(c).slice(-17);
         if(vinOK(v)){ gotVin=v; break; }
@@ -520,7 +585,18 @@ window.addEventListener("DOMContentLoaded", () => {
       if(data){
         const h=harvest(data.text);
         if(!gotVin) for(const v of h.vins) if(vinOK(v)){ gotVin=v; break; }
-        h.vins.forEach(v=>offer(v));
+        if(!gotVin) for(const v of h.vins){
+          const fx=fixVin(v);
+          if(fx.length){
+            // Let NHTSA break ties: put first the candidate it recognises as a real vehicle.
+            $("scanMsg").textContent="Photo was unclear — checking possible VINs with NHTSA…";
+            const ok=await Promise.all(fx.map(probe));
+            const order=fx.map((c,k)=>[c,ok[k]]).sort((x,y)=>y[1]-x[1]).map(x=>x[0]);
+            gotVin=order[0]; guessed={from:v,alts:order.slice(1)}; break;
+          }
+        }
+        if(guessed) [gotVin,...guessed.alts].forEach(v=>offer(v));
+        else h.vins.filter(vinOK).forEach(v=>offer(v));
         h.bits.forEach(b=>offer(b));
         (data.lines||[]).filter(l=>l.confidence>62 && l.text.trim().length>2)
           .slice(0,22).forEach(l=>offer(l.text.trim().replace(/\s+/g," ")));
@@ -531,7 +607,9 @@ window.addEventListener("DOMContentLoaded", () => {
         $("scanMsg").innerHTML="<b>VIN found and check-digit verified.</b> Decoding…";
         await decode();
         const got=$("ident").textContent;
-        $("scanMsg").innerHTML="<b>VIN verified"+(got?" — "+got:"")+".</b> Tap any other value below to drop it into a question.";
+        $("scanMsg").innerHTML = guessed
+          ? "<b>Best guess at the VIN"+(got?" — "+got:"")+".</b> The photo was unclear, so some characters were corrected. <span class='flag'>Check it against the dash plate</span>"+(guessed.alts.length?" — or tap one of the other candidates below.":".")
+          : "<b>VIN verified"+(got?" — "+got:"")+".</b> Tap any other value below to drop it into a question.";
       } else {
         const n=$("found").children.length;
         $("scanMsg").textContent = n
